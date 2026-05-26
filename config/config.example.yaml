@@ -1,0 +1,22 @@
+env: local
+
+http:
+  port: 8080
+  shutdown_timeout: 10s
+
+db:
+  dsn: "postgres://postgres:CHANGE_ME@localhost:5432/app?sslmode=disable"
+  max_open_conns: 25
+  max_idle_conns: 25
+  conn_max_lifetime: 30m
+  auto_migrate: false
+
+outbox:
+  poll_interval: 2s
+  batch_size: 100
+  max_attempts: 5
+  base_backoff: 1s
+  max_backoff: 1m
+
+log:
+  level: debug

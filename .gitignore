@@ -1,0 +1,8 @@
+/bin/
+*.env
+.env
+vendor/
+.DS_Store
+.claude
+.idea/
+/config/config.yaml
