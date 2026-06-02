@@ -1,36 +1,17 @@
 # golangci-lint v2 configuration.
-# The depguard rules enforce module isolation: a module may only reach another
-# module through its public *port package, never its domain/service/repository.
+#
+# Module isolation is now enforced by the Go compiler via the internal/
+# package mechanism: anything under internal/modules/<name>/internal/ is
+# unreachable from outside that module. Cross-module deny rules are no longer
+# needed here. depguard will come back in Phase 4 when we need to forbid
+# leaking concrete provider names (visa, kortimilli, etc.) outside the
+# provider module.
 version: "2"
 
 linters:
   enable:
-    - depguard
     - errcheck
     - govet
     - ineffassign
     - staticcheck
     - unused
-  settings:
-    depguard:
-      rules:
-        payment-module:
-          files:
-            - "**/internal/modules/payment/**/*.go"
-          deny:
-            - pkg: github.com/monorepo/internal/modules/account/domain
-              desc: "use accountport instead of reaching into account internals"
-            - pkg: github.com/monorepo/internal/modules/account/service
-              desc: "use accountport instead of reaching into account internals"
-            - pkg: github.com/monorepo/internal/modules/account/repository
-              desc: "use accountport instead of reaching into account internals"
-        account-module:
-          files:
-            - "**/internal/modules/account/**/*.go"
-          deny:
-            - pkg: github.com/monorepo/internal/modules/payment/domain
-              desc: "use paymentport instead of reaching into payment internals"
-            - pkg: github.com/monorepo/internal/modules/payment/service
-              desc: "use paymentport instead of reaching into payment internals"
-            - pkg: github.com/monorepo/internal/modules/payment/repository
-              desc: "use paymentport instead of reaching into payment internals"

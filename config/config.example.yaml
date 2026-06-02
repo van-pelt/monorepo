@@ -2,14 +2,20 @@ env: local
 
 http:
   port: 8080
-  shutdown_timeout: 10s
+  request_timeout: 10s   # applied per-request via middleware; pairs with db.statement_timeout
+  shutdown_timeout: 15s  # > request_timeout so in-flight requests get a chance to finish
 
 db:
+  # Literal DSN works out of the box for local dev.
   dsn: "postgres://postgres:CHANGE_ME@localhost:5432/app?sslmode=disable"
+  # Or reference an env variable (resolved by platform/security at startup):
+  #   dsn: "secret:DATABASE_URL"
+  # When Vault is added, the same `secret:NAME` form routes through the
+  # configured provider — no code changes needed in modules.
   max_open_conns: 25
   max_idle_conns: 25
   conn_max_lifetime: 30m
-  auto_migrate: false
+  statement_timeout: 5s  # server-side query cap; appended to DSN by postgres.Connect
 
 outbox:
   poll_interval: 2s
@@ -17,6 +23,35 @@ outbox:
   max_attempts: 5
   base_backoff: 1s
   max_backoff: 1m
+
+rabbitmq:
+  dsn: "amqp://guest:guest@localhost:5672/"
+  exchange: "events"
+  dlx: "events.dlx"
+
+consumers:
+  # Bulkhead: caps in-flight handlers per (consumer, topic) and sets the AMQP
+  # prefetch count — broker stops delivering once N are in flight, so one
+  # slow topic cannot starve the others.
+  default_concurrency: 4
+  # Per-handler invocation deadline; ctx cancels at this point.
+  handler_timeout: 30s
+  # How often the consumer_queue_depth gauge is refreshed via passive
+  # QueueDeclare. Cheap (one round-trip per queue) — bump if you have many
+  # queues, lower for tighter visibility.
+  queue_depth_poll_interval: 30s
+
+redis:
+  # Leave empty to disable Redis-backed features (idempotency middleware).
+  dsn: "redis://localhost:6379/0"
+
+# Static feature flags loaded into the in-memory provider at startup.
+# Replace platform/featureflags's InMemoryProvider with a remote-config
+# Provider (LaunchDarkly, Unleash, ...) when runtime toggling is needed.
+feature_flags:
+  # Example — uncomment to enable, then read in code via:
+  #   flags.Bool(ctx, "enable_new_payment_flow", false)
+  # enable_new_payment_flow: true
 
 log:
   level: debug

@@ -1,7 +1,8 @@
-.PHONY: help config up down tidy run build test lint
+.PHONY: help config up down tidy run build migrate test lint
 
-APP_BINARY := bin/app
-COMPOSE    := docker compose -f deploy/docker-compose.yaml
+API_BINARY     := bin/api
+MIGRATE_BINARY := bin/migrate
+COMPOSE        := docker compose -f deploy/docker-compose.yaml
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -19,11 +20,15 @@ down: ## Stop local Postgres and remove volumes
 tidy: ## Resolve and lock module dependencies
 	go mod tidy
 
-run: ## Run the application
-	go run ./cmd/app
+run: ## Run the API server
+	go run ./cmd/api
 
-build: ## Build the binary into bin/
-	go build -o $(APP_BINARY) ./cmd/app
+build: ## Build both binaries into bin/
+	go build -o $(API_BINARY) ./cmd/api
+	go build -o $(MIGRATE_BINARY) ./cmd/migrate
+
+migrate: ## Apply all SQL migrations (run before `make run` on a fresh DB)
+	go run ./cmd/migrate up
 
 test: ## Run all tests
 	go test ./...
