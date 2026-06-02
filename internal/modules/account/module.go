@@ -1,41 +1,36 @@
 // Package account is the account module's wiring layer: it builds the module's
-// layers, exposes its public port and subscribes to events from other modules.
+// layers, exposes its public API and subscribes to events from other modules.
+// HTTP handlers live in cmd/api/handlers and consume only the api package.
 package account
 
 import (
 	"context"
-	"embed"
 	"encoding/json"
 	"errors"
-	"io/fs"
 
-	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
 	"github.com/jmoiron/sqlx"
 	"github.com/rs/zerolog"
 
-	"github.com/monorepo/internal/modules/account/accountport"
-	"github.com/monorepo/internal/modules/account/domain"
-	"github.com/monorepo/internal/modules/account/repository"
-	"github.com/monorepo/internal/modules/account/service"
-	"github.com/monorepo/internal/modules/account/transport"
-	"github.com/monorepo/internal/modules/payment/paymentport"
-	"github.com/monorepo/internal/shared/messaging"
-	"github.com/monorepo/internal/shared/postgres"
+	accountapi "github.com/monorepo/internal/modules/account/api"
+	"github.com/monorepo/internal/modules/account/internal/domain"
+	"github.com/monorepo/internal/modules/account/internal/repository"
+	"github.com/monorepo/internal/modules/account/internal/service"
+	paymentapi "github.com/monorepo/internal/modules/payment/api"
+	"github.com/monorepo/internal/platform/consumers"
+	"github.com/monorepo/internal/platform/messaging"
+	"github.com/monorepo/internal/platform/postgres"
 )
 
-//go:embed migrations/*.sql
-var migrationsFS embed.FS
-
-// Module is the account vertical slice. It implements module.Module.
+// Module is the account vertical slice. cmd/api wires it explicitly — there
+// is no Module interface.
 type Module struct {
-	svc     service.Service
-	handler *transport.Handler
-	log     zerolog.Logger
+	svc service.Service
+	log zerolog.Logger
 }
 
-// New builds the account module and wires its repository, service and
-// transport layers. It also subscribes to payment events.
+// New builds the account module and wires its repository and service layers.
+// It also subscribes to payment events.
 func New(db *sqlx.DB, subscriber messaging.Subscriber, log zerolog.Logger) *Module {
 	l := log.With().Str("module", "account").Logger()
 
@@ -43,61 +38,77 @@ func New(db *sqlx.DB, subscriber messaging.Subscriber, log zerolog.Logger) *Modu
 	uow := postgres.NewUnitOfWork(db)
 	svc := service.New(db, uow, repo, l)
 
-	m := &Module{
-		svc:     svc,
-		handler: transport.NewHandler(svc),
-		log:     l,
-	}
+	m := &Module{svc: svc, log: l}
 
-	// The account module reacts to payments asynchronously (eventual
-	// consistency): when a payment is created, it settles the funds transfer.
-	subscriber.Subscribe(paymentport.TopicPaymentCreated, m.onPaymentCreated)
+	// payment.created drives an async funds transfer. consumers.Dedup
+	// wraps the handler so the processed_events mark and the transfer
+	// commit in the same tx — exactly-once-effect under at-least-once
+	// broker delivery.
+	subscriber.Subscribe(
+		paymentapi.TopicPaymentCreated,
+		consumers.Dedup(uow, "account", m.onPaymentCreatedTx),
+	)
 	return m
 }
 
 func (m *Module) Name() string { return "account" }
 
-func (m *Module) RegisterRoutes(r fiber.Router) { m.handler.Register(r) }
-
-func (m *Module) Migrations() fs.FS { return migrationsFS }
-
-// Provider exposes the account module's synchronous public port, which other
-// modules receive at the composition root.
-func (m *Module) Provider() accountport.AccountProvider {
-	return providerAdapter{svc: m.svc}
+// API exposes the account module's synchronous public surface. cmd/api uses
+// it both for HTTP handlers and to inject into other modules that need a
+// synchronous account dependency.
+func (m *Module) API() accountapi.Service {
+	return apiAdapter{svc: m.svc}
 }
 
-// onPaymentCreated settles a payment by transferring funds between accounts.
-// It must be idempotent: the outbox guarantees at-least-once delivery.
-func (m *Module) onPaymentCreated(ctx context.Context, e messaging.Event) error {
-	var evt paymentport.PaymentCreated
+// onPaymentCreatedTx settles a payment by transferring funds between accounts
+// inside the tx provided by consumers.Dedup. Redeliveries are short-circuited
+// upstream of this method.
+func (m *Module) onPaymentCreatedTx(ctx context.Context, q postgres.Querier, e messaging.Event) error {
+	var evt paymentapi.PaymentCreated
 	if err := json.Unmarshal(e.Payload, &evt); err != nil {
 		return err
 	}
 	m.log.Info().
+		Str("event_id", e.ID.String()).
 		Str("payment_id", evt.PaymentID.String()).
 		Int64("amount", evt.Amount).
 		Msg("settling payment")
-	return m.svc.Transfer(ctx, evt.FromAccountID, evt.ToAccountID, evt.Amount)
+	return m.svc.TransferTx(ctx, q, evt.FromAccountID, evt.ToAccountID, evt.Amount)
 }
 
-// providerAdapter adapts the internal service to the public AccountProvider
-// port, translating domain errors into the port's error contract.
-type providerAdapter struct {
+// apiAdapter implements accountapi.Service against the in-process service.
+// A future gRPC client would implement the same interface against a remote
+// process — handlers in cmd/api wouldn't change.
+type apiAdapter struct {
 	svc service.Service
 }
 
-func (p providerAdapter) GetByID(ctx context.Context, id uuid.UUID) (accountport.AccountInfo, error) {
-	acc, err := p.svc.GetAccount(ctx, id)
+func (a apiAdapter) CreateAccount(ctx context.Context, in accountapi.CreateAccountInput) (accountapi.Account, error) {
+	acc, err := a.svc.CreateAccount(ctx, in.OwnerID, in.Currency)
+	if err != nil {
+		return accountapi.Account{}, err
+	}
+	return toAPI(acc), nil
+}
+
+func (a apiAdapter) GetByID(ctx context.Context, id uuid.UUID) (accountapi.Account, error) {
+	acc, err := a.svc.GetAccount(ctx, id)
 	if err != nil {
 		if errors.Is(err, domain.ErrAccountNotFound) {
-			return accountport.AccountInfo{}, accountport.ErrAccountNotFound
+			return accountapi.Account{}, accountapi.ErrAccountNotFound
 		}
-		return accountport.AccountInfo{}, err
+		return accountapi.Account{}, err
 	}
-	return accountport.AccountInfo{
-		ID:       acc.ID,
-		OwnerID:  acc.OwnerID,
-		Currency: acc.Currency,
-	}, nil
+	return toAPI(acc), nil
+}
+
+func toAPI(a *domain.Account) accountapi.Account {
+	return accountapi.Account{
+		ID:        a.ID,
+		OwnerID:   a.OwnerID,
+		Currency:  a.Currency,
+		Balance:   a.Balance,
+		CreatedAt: a.CreatedAt,
+		UpdatedAt: a.UpdatedAt,
+	}
 }
